@@ -13,7 +13,7 @@ from .utils import mask_to_mirrored_num
 
 
 __all__ = ['DiscretePRF', 'create_prf', 'psf_photometry',
-           'GaussianPSF', 'subtract_psf']
+           'GaussianPSF', 'subtract_psf','GroupPSF','ImagePSF']
 
 
 class DiscretePRF(Fittable2DModel):
@@ -176,6 +176,7 @@ class DiscretePRF(Fittable2DModel):
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", AstropyUserWarning)
                 m = self.fitter(self, x, y, sub_array_data)
+                self.fit_result = m
             return m.amplitude.value
         else:
             return 0
@@ -306,6 +307,283 @@ class GaussianPSF(Fittable2DModel):
         else:
             return 0
 
+class GroupPSF:
+    """
+    This represents the PSFs of a group of sources. In general
+    a GroupPSF should only be created by the simultaneous photometry
+    function.
+    """
+    def __init__(self, group_id, psf, positions=None, psf_width=None, 
+            patch_boundaries=None, mask_img=True, 
+            show_plots=True, **kwargs):
+        if isinstance(psf, GroupPSF):
+            self.__dict__ = psf.__dict__.copy()
+        else:
+            self.group_id = group_id
+            self.psf = psf.copy()
+            if psf_width is None and hasattr(self.psf, '_prf_array'):
+                psf_width = self.psf._prf_array[0][0].shape[0]
+            if psf_width % 2==0:
+                raise Exception("psf_width must be an odd number")
+            self.positions = positions
+            self.psf_width = psf_width
+            self.mask_img = mask_img
+            self.show_plots = show_plots
+            self.patch_boundaries=patch_boundaries
+            self.combined_psf = None
+    def get_patch(self, data, positions=None, width=None, 
+            patch_boundaries=None):
+        """
+        Given a list of positions, get the patch of the data that
+        contains all of the positions and their PRF radii and mask
+        out all of the other pixels (to prevent sources outside the
+        group from polluting the fit).
+    
+        Parameters
+        ----------
+        data: ndarray
+            Image array data
+        positions: list or array (optional)
+            List of positions to include in the patch. If no 
+            positions are passed the function will use 
+            ``GroupPSF.positions``.
+        width: int (optional)
+            Width (in pixels) of the PRF. This should be an odd 
+            number equal to 2*prf_radius+1 and defaults to 
+            ``GroupPSF.psf_width``
+        patch_boundaries: list or array (optional)
+            Boundaries of the data patch of the form 
+            [ymin,ymax,xmin,xmax]
+        """
+        if positions is None:
+            positions = np.array(self.positions)
+        if width is None:
+            width = self.psf_width
+    
+        # Extract the patch of data that includes all of the sources
+        # and their psf radii
+        if patch_boundaries is None:
+            if self.patch_boundaries is None:
+                x = positions[:,0]
+                y = positions[:,1]
+                radius = int((width-1)/2)
+                xc = np.round(x).astype('int')
+                yc = np.round(y).astype('int')
+                self.boundaries = [
+                    min(yc)-radius, # ymin
+                    max(yc)+radius+1, #ymax
+                    min(xc)-radius, #xmin
+                    max(xc)+radius+1 #xmax
+                ]
+            patch_boundaries = self.boundaries
+        ymin,ymax,xmin,xmax = patch_boundaries
+        sub_data = data[ymin:ymax,xmin:xmax]
+        
+        # If the group is large enough, sources not contained 
+        # in the group might be located in the same square patch, 
+        # so we mask out everything outside of the radius the 
+        # individual sources PSFs
+        if self.mask_img:
+            sub_data = np.ma.array(sub_data)
+            mask = np.ones(data.shape, dtype='bool')
+            mask_X = np.arange(data.shape[1])
+            mask_Y = np.arange(data.shape[0])
+            mask_X, mask_Y = np.meshgrid(mask_X, mask_Y)
+            for xc,yc in zip(x,y):
+                mask = mask & (
+                    (mask_X-xc)**2+(mask_Y-yc)**2>=(radius)**2)
+    
+            sub_data.mask = mask[ymin:ymax,xmin:xmax]
+            sub_data = sub_data.filled(0)
+    
+        # Optionally plot the mask and data patch
+        if self.show_plots:
+            try:
+                import matplotlib
+                import matplotlib.pyplot as plt
+                from mpl_toolkits.mplot3d.axes3d import Axes3D
+            except ImportError:
+                raise Exception(
+                    "You must have matplotlib installed"
+                    " to create plots")
+            # Plot mask
+            if self.mask_img:
+                plt.imshow(mask[ymin:ymax,xmin:xmax])
+    
+            # Plot masked patch used for fit
+            X = np.arange(0, sub_data.shape[1], 1)
+            Y = np.arange(0, sub_data.shape[0], 1)
+            X, Y = np.meshgrid(X, Y)
+            fig = plt.figure()
+            ax = fig.add_subplot(111, projection='3d')
+            ax.plot_wireframe(X, Y, sub_data)
+            plt.show()
+        return sub_data, (xmin, xmax), (ymin, ymax)
+    
+    def fit(self, data, positions=None, psfs=None, psf_width=None,
+            patch_boundaries=None, fitter=None):
+        """
+        Simultaneously fit all of the sources in a PSF group. This 
+        functions makes a copy of the PSF for each source and creates 
+        an astropy `astropy.models.CompoundModel` that is fit but the PSF's
+        ``fitter`` function.
+    
+        Parameters
+        ----------
+        data: ndarray
+            Image data array
+        positions : List or array (optional)
+            List of positions in pixel coordinates
+            where to fit the PSF/PRF. Ex: [(0.0,0.0),(1.0,2.0), (10.3,-3.2)]
+        psfs : list of PSFs (optional)
+            It is possible to choose a different PSF for each model, 
+            in which case ``psfs`` should have the same length as positions
+        psf_width: int (optional)
+            Width of the PRF arrays. If all of the ``prfs`` are
+            `photutils.psf.GaussianPSF` models then this will have to be
+            set, otherwise it will automatically be calculated
+        patch_boundaries: list or array (optional)
+            Boundaries of the data patch of the form 
+            [ymin,ymax,xmin,xmax]
+        """
+        if positions is None:
+            positions = np.array(self.positions)
+        x = positions[:,0]
+        y = positions[:,1]
+        
+        if len(positions)==1:
+            self.psf.x_0, self.psf.y_0 = positions[0]
+            indices = np.indices(data.shape)
+            result = [self.psf.fit(data, indices)]
+        else:
+            if psfs is None:
+                psfs = [self.psf.copy() for p in range(len(positions))]
+            if psf_width is None:
+                if self.psf_width is not None:
+                    psf_width = self.psf_width
+                else:
+                    psf_width = psfs[0]._prf_array[0][0].shape[0]
+            if fitter is None:
+                if self.psf is not None:
+                    fitter = self.psf.fitter
+                else:
+                    fitter = psfs[0].fitter
+            sub_data, x_range, y_range = self.get_patch(
+                data, positions, psf_width, patch_boundaries)
+    
+            # Created a CompountModel that is a combination of the individual PRF's
+            combined_psf = None
+            for x0, y0, single_psf in zip(x,y,psfs):
+                single_psf.x_0 = x0
+                single_psf.y_0 = y0
+                if combined_psf is None:
+                    combined_psf = single_psf
+                else:
+                    combined_psf += single_psf
+            # Fit the combined PRF
+            indices = np.indices(data.shape)
+            x_fit, y_fit = np.meshgrid(
+                np.arange(x_range[0],x_range[1], 1),
+                np.arange(y_range[0],y_range[1], 1))
+            self.combined_psf = fitter(combined_psf, x_fit, y_fit, sub_data)
+    
+            # Return the list of fluxes for all of the sources in the group 
+            # and the combined PRF
+            result = [getattr(self.combined_psf,'amplitude_'+str(n)).value 
+                for n in range(len(x))]
+        return result
+
+class ImagePSF:
+    """
+    Collection of Groups and PSFs for an entire image
+    """
+    def __init__(self, positions=None, psf=None, separation=None,
+            cluster_method='dbscan', psf_width=None, mask_img=True,
+            show_plots=False, groups=[]):
+        self.positions = positions
+        self.psf = psf
+        self.separation = separation
+        self.cluster_method = cluster_method
+        self.psf_width = psf_width
+        self.mask_img = mask_img
+        self.show_plots = show_plots
+        self.groups = groups
+        self.group_indices = range(len(self.groups))
+    
+    def create_groups(self, positions=None, separation=None, 
+            cluster_method='dbscan'):
+        """
+        Group sources with overlapping PSF's
+        """
+        if separation is None:
+            separation = self.psf._prf_array[0][0].shape[0]
+        if positions is None:
+            positions = self.positions
+        
+        if cluster_method=='dbscan':
+            # If user has sklearn installed, use DBSCAN to cluster the objects
+            # in groups with overlapping PSF's
+            try:
+                from sklearn.cluster import DBSCAN
+                from sklearn import metrics
+                from sklearn.datasets.samples_generator import make_blobs
+                from sklearn.preprocessing import StandardScaler
+            except ImportError:
+                Exception("You must install sklearn to use 'dbscan' clustering")
+            
+            
+            pos_array = np.array(positions)
+            # Compute DBSCAN
+            db = DBSCAN(eps=separation, min_samples=1).fit(pos_array)
+            self.db = db
+            self.groups = []
+            self.group_indices = np.unique(db.labels_)
+            self.src_indices = db.labels_
+            
+        for group in self.group_indices:
+            # Create PSF object for the entire group
+            group_psf = GroupPSF(
+                group, self.psf, pos_array[group==self.src_indices], 
+                self.psf_width, mask_img=self.mask_img, 
+                show_plots=self.show_plots)
+            self.groups.append(group_psf)
+        if self.show_plots:
+            try:
+                import matplotlib
+                import matplotlib.pyplot as plt
+            except ImportError:
+                raise Exception(
+                    "You must have matplotlib installed to create plots")
+            fig, ax = plt.subplots()
+            x = pos_array[:,0]
+            y = pos_array[:,1]
+            for group in self.group_indices:
+                ax.plot(
+                    x[self.src_indices==group], 
+                    y[self.src_indices==group], 'o')
+            plt.show()
+        return self.groups
+    
+    def get_psf_photometry(self, data, positions=None, psfs=None,
+            separation=None, group_sources=True):
+        if positions is None:
+            if self.positions is None:
+                raise Exception("You must supply a list of positions")
+            positions = self.positions
+                
+        if group_sources:
+            self.create_groups(positions)
+        self.psf_flux = np.zeros(len(positions))
+        pos_array = np.array(positions)
+        for group in self.groups:
+            fit_parameters = {
+                'positions': pos_array[self.src_indices==group.group_id]
+            }
+            if psfs is not None:
+                fit_parameters['psfs'] = psfs[self.src_indices==group.group_id]
+            group_flux = group.fit(data,**fit_parameters)
+            self.psf_flux[self.src_indices==group.group_id] = np.array(group_flux)
+        return self.psf_flux
 
 def psf_photometry(data, positions, psf, mask=None, mode='sequential',
                    tune_coordinates=False):
